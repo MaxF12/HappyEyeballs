@@ -5,27 +5,26 @@ use std::net::{ToSocketAddrs, SocketAddr, TcpStream};
 use std::thread;
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, Duration};
-use std::thread::{JoinHandle, Thread};
-use std::collections::HashMap;
-use std::panic::resume_unwind;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::SeqCst;
+use std::fs::{File, remove_file};
+use std::io::Write;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn setup_config() -> Result<Config, Box<dyn Error>> {
-        let arg_list = [String::from("rust.exe"), String::from("1"), String::from("50")];
-        Ok(Config::new(&arg_list)?)
+        let arg_list = vec![String::from("rust.exe"), String::from("1"), String::from("10")];
+        Ok(Config::new(arg_list)?)
     }
 
     #[test]
     fn try_get_alexa_rankings() {
         let mut domains = setup_config().unwrap_or_else(|_| panic!("Error setting up config"));
         let domains = domains.get_domains().unwrap();
-        assert!(domains.iter().any(|i| i.lock().unwrap().get_url().contains(&String::from("yahoo.com"))));
-        assert_eq!(domains.len(), 50);
+        assert!(domains.iter().any(|i| i.lock().unwrap().get_url().contains(&String::from("google.com"))));
+        assert_eq!(domains.len(), 10);
     }
 
     #[test]
@@ -38,7 +37,7 @@ mod tests {
 
     #[test]
     fn take_times() {
-        let mut domain = setup_config().unwrap_or_else(|_| panic!("Error setting up config"));
+        let domain = setup_config().unwrap_or_else(|_| panic!("Error setting up config"));
         domain.resolve_domains();
         domain.take_time();
         assert_eq!(1, 1);
@@ -55,7 +54,14 @@ mod tests {
 
     #[test]
     fn try_csv() {
-
+        let filename = "results.csv";
+        let domains = setup_config().unwrap_or_else(|_| panic!("Error setting up config"));
+        domains.resolve_domains();
+        domains.take_time();
+        domains.save_results(filename).unwrap_or_else(|_| panic!("Error setting up config"));
+        let content = fs::read_to_string(filename)
+            .expect("File not readable");
+        assert_eq!(content.lines().count(), 10);
     }
 
 }
@@ -66,7 +72,7 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn new(args: &[String]) -> Result<Config, Box<dyn Error>> {
+    pub fn new(args: Vec<String>) -> Result<Config, Box<dyn Error>> {
         if args.len() < 3 {
             return Err("not enough arguments".into());
         }
@@ -99,7 +105,9 @@ impl Config {
             }));
         }
         for handle in handles {
-            handle.join().unwrap();
+            handle.join().unwrap_or_else(|error| {
+                println!("Could not join threads: {:?}", error);
+            });
         }
 
         let time = Instant::now() - time;
@@ -111,8 +119,14 @@ impl Config {
         for domain in &self.domains {
             let domain = domain.clone();
             handles.push(thread::spawn(move || {
-                domain.lock().unwrap().time_v4();
-                domain.lock().unwrap().time_v6();
+                domain.lock().unwrap().time_v4().unwrap_or_else(|error| {
+                    println!("Could not take time: {:?}", error);
+                    Duration::new(10000,10000)
+                });
+                domain.lock().unwrap().time_v6().unwrap_or_else(|error| {
+                    println!("Could not take time: {:?}", error);
+                    Duration::new(10000,10000)
+                });
             }));
         }
         for handle in handles {
@@ -133,8 +147,21 @@ impl Config {
         }
     }
 
-    pub fn to_csv(&self, ) {
-
+    pub fn save_results(&self, filename: &str) -> std::io::Result<()> {
+        println!("Saving CSV");
+        let mut file = File::create(filename).unwrap_or_else(|error| {
+            println!("File already exists, deleting: {:?}", error);
+            remove_file(filename).unwrap_or_else(|err| {
+                panic!("Deleting of file failed: {:?}", err);
+            });
+            File::create(filename).unwrap()
+        });
+        for d in &self.domains {
+            let d = d.lock().unwrap();
+            let line = format!("{:?};{:?};{:?};{:?};{:?};{:?};{:?}\n", d.url, d.v4, d.v4.len(), d.connect_time_v4.unwrap().as_nanos(), d.v6, d.v6.len(), d.connect_time_v6.unwrap().as_nanos());
+            file.write_all(line.as_ref())?;
+        }
+        Ok(())
     }
 }
 
@@ -142,13 +169,15 @@ pub struct Domain {
     url: String,
     v4: Vec<SocketAddr>,
     v6: Vec<SocketAddr>,
+    connect_time_v4: Option<Duration>,
+    connect_time_v6: Option<Duration>,
     connected: Arc<AtomicBool>,
     stream: Arc<Mutex<Option<TcpStream>>>
 }
 
 impl Domain {
     pub fn new(url: String) -> Domain {
-        Domain {url, v4: Vec::new(), v6: Vec::new(), connected: Arc::new(AtomicBool::new(false)), stream: Arc::new(Mutex::new(None)) }
+        Domain {url, v4: Vec::new(), v6: Vec::new(), connect_time_v4: None, connect_time_v6: None, connected: Arc::new(AtomicBool::new(false)), stream: Arc::new(Mutex::new(None)) }
     }
 
     pub fn get_url(&self) -> &String {
@@ -182,24 +211,38 @@ impl Domain {
 
     }
     // Returns average v4 time
-    pub fn time_v4(&self) -> std::io::Result<Duration> {
+    pub fn time_v4(&mut self) -> std::io::Result<Duration> {
         let mut duration = Duration::new(0,0);
+        let mut count = 0;
         for addr in &self.v4 {
-            duration += Domain::take_time(addr).unwrap();
+            count += 1;
+            duration += Domain::take_time(addr).unwrap_or_else(|_|{
+                count -= 1;
+                Duration::from_millis(0)
+            });
         }
-        let duration = duration;
+        if count == 0 { duration = Duration::from_millis(0);}
+        else { duration = Duration::from_millis((duration.as_millis() / count) as u64); }
         //println!("Average time v4 for domain {:?}: {:?}",self.url ,duration);
+        self.connect_time_v4 = Some(duration);
         Ok(duration)
     }
 
     // Returns average v6 time
-    pub fn time_v6(&self) -> std::io::Result<Duration> {
+    pub fn time_v6(&mut self) -> std::io::Result<Duration> {
         let mut duration = Duration::new(0,0);
+        let mut count = 0;
         for addr in &self.v6 {
-            duration += Domain::take_time(addr).unwrap();
+            count += 1;
+            duration += Domain::take_time(addr).unwrap_or_else(|_|{
+                count -= 1;
+                Duration::from_millis(0)
+            });
         }
-        let duration = duration;
+        if count == 0 { duration = Duration::from_millis(0);}
+        else { duration = Duration::from_millis((duration.as_millis() / count) as u64); }
         //println!("Average time v6 for domain {:?}: {:?}",self.url ,duration);
+        self.connect_time_v6 = Some(duration);
         Ok(duration)
     }
 

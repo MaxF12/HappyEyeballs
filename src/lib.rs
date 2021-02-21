@@ -67,7 +67,7 @@ mod tests {
 }
 
 pub struct Config {
-    _attempts: usize,
+    attempts: usize,
     domains: Vec<Arc<Mutex<Domain>>>
 }
 
@@ -76,10 +76,10 @@ impl Config {
         if args.len() < 3 {
             return Err("not enough arguments".into());
         }
-        let _attempts = args[1].parse().unwrap();
+        let attempts = args[1].parse().unwrap();
         let sites =  args[2].parse().unwrap();
 
-        let websites = env::var("ALEXA_FILE").unwrap_or_else(|_| String::from("alexa.txt"));
+        let websites = env::var("ALEXA_FILE").unwrap_or_else(|_| String::from("alexa.csv"));
         let websites = fs::read_to_string(websites)?;
         let mut domains = Vec::new();
         // Take the first self.sites lines of the websites, split away the rank and collect them to a vec
@@ -88,7 +88,7 @@ impl Config {
             page.split(",").collect::<Vec<&str>>()[1])){
             domains.push(Arc::new(Mutex::new(Domain::new(result))));
         }
-        Ok(Config { _attempts, domains})
+        Ok(Config { attempts, domains})
     }
 
     pub fn get_domains(&mut self) -> Result<&mut Vec<Arc<Mutex<Domain>>>, Box<dyn Error>> {
@@ -98,16 +98,25 @@ impl Config {
     pub fn resolve_domains(&self) {
         let time = Instant::now();
         let mut handles = Vec::new();
+        let n = self.attempts;
         for domain in &self.domains {
             let domain = domain.clone();
             handles.push(thread::spawn(move || {
-                domain.lock().unwrap().resolve();
+                for _ in 0..n {
+                    domain.lock().unwrap().resolve();
+                };
             }));
         }
         for handle in handles {
             handle.join().unwrap_or_else(|error| {
                 println!("Could not join threads: {:?}", error);
             });
+        }
+        for domain in &self.domains {
+            domain.lock().unwrap().v4.sort_unstable();
+            domain.lock().unwrap().v4.dedup();
+            domain.lock().unwrap().v6.sort_unstable();
+            domain.lock().unwrap().v6.dedup();
         }
 
         let time = Instant::now() - time;
@@ -127,7 +136,8 @@ impl Config {
                     println!("Could not take time: {:?}", error);
                     Duration::new(10000,10000)
                 });
-            }));
+            println!("{:?}", domain.lock().unwrap().url);
+           }));
         }
         for handle in handles {
             handle.join().unwrap();
@@ -218,11 +228,11 @@ impl Domain {
             count += 1;
             duration += Domain::take_time(addr).unwrap_or_else(|_|{
                 count -= 1;
-                Duration::from_millis(0)
+                Duration::from_nanos(0)
             });
         }
-        if count == 0 { duration = Duration::from_millis(0);}
-        else { duration = Duration::from_millis((duration.as_millis() / count) as u64); }
+        if count == 0 { duration = Duration::from_nanos(0);}
+        else { duration = Duration::from_nanos((duration.as_nanos() / count) as u64); }
         //println!("Average time v4 for domain {:?}: {:?}",self.url ,duration);
         self.connect_time_v4 = Some(duration);
         Ok(duration)
@@ -236,11 +246,11 @@ impl Domain {
             count += 1;
             duration += Domain::take_time(addr).unwrap_or_else(|_|{
                 count -= 1;
-                Duration::from_millis(0)
+                Duration::from_nanos(0)
             });
         }
-        if count == 0 { duration = Duration::from_millis(0);}
-        else { duration = Duration::from_millis((duration.as_millis() / count) as u64); }
+        if count == 0 { duration = Duration::from_nanos(0);}
+        else { duration = Duration::from_nanos((duration.as_nanos() / count) as u64); }
         //println!("Average time v6 for domain {:?}: {:?}",self.url ,duration);
         self.connect_time_v6 = Some(duration);
         Ok(duration)

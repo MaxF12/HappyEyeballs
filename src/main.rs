@@ -8,7 +8,10 @@ fn main() {
         eprintln!("Problem parsing arguments: {}", err);
         process::exit(1);
     });
+    let mut time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
     domains.resolve_domains();
     domains.take_time();
     domains.save_results(&*filename).unwrap_or_else(|_| panic!("Error saving results."));
+    time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() - time;
+    println!("Execution done, time taken: {:?}", time)
 }
